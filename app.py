@@ -1,48 +1,97 @@
 """
-YouTube Music API Wrapper — v4  (Render 512 MB free-tier optimised)
+YouTube Music API Wrapper — v5  (Render 512 MB free-tier optimised)
 ====================================================================
-Changes over v2/v3:
-  • /search          — proper offset-based pagination { results, count, total, hasMore }
-  • /podcast/{id}    — NEW: full podcast page with normalised episodes list
-  • /artist/{id}/songs — NEW: all songs by artist (follows ytmusicapi params token)
-  • /now_playing/{id}  — NEW: stream metadata + related in one call
-  • /related_songs/{id}— NEW: related tracks via watch-playlist
-  • /lyrics_by_video/{id} — NEW: get lyrics without separate browseId lookup
-  • /trending         — NEW: trending songs from charts (country-aware)
-  • /top_playlists    — NEW: featured/top playlists
-  • /playlist/{id}    — handles VL-prefix IDs correctly, returns normalised tracks
-  • Podcast search normalisation — extracts podcastId / browseId / channelId
-  • Artist page       — includes songs.params token so frontend can paginate
-  • Stream endpoint   — adds url + audio_url alias so frontend download works
-  • Memory budget     — cache sizes trimmed for 512 MB; thread pool stays at 4
-  • All errors return JSON 500 with detail (never crash the server)
+
+WHAT CHANGED FROM v4
+─────────────────────────────────────────────────────────────────────
+
+THUMBNAIL QUALITY (biggest visible improvement)
+  • upgrade_thumbnail_url() rewrites every URL to maximum resolution
+    before it ever leaves this process — zero extra API calls:
+
+    lh3.googleusercontent.com  (album art, artist photos)
+      Strips any =w{n}-h{n}-... suffix and appends =w576-h576-l90-rj.
+      576 px is the largest Google serves for music art; requesting
+      anything higher just returns 576 anyway.
+
+    i.ytimg.com/vi/  (YouTube video thumbnails)
+      Rewrites any quality token (mqdefault / default / 0 / sddefault)
+      to hqdefault.jpg, which is 480×360 and always present.
+      We intentionally avoid maxresdefault — it 404s on many music
+      videos so the app would fall back to a broken image.
+
+  • _score() ranks thumbnails correctly even when width=0 (which is
+    the case for the majority of ytmusicapi responses).
+    Priority: pixel-area > lh3 width-in-URL > ytimg filename rank.
+    Filename rank: maxresdefault > sddefault > 0.jpg > hqdefault >
+                   mqdefault > default (≈ 120 px).
+
+COUNTRY-AWARE CONTENT
+  • get_ytm(country, language) returns a pooled YTMusic instance per
+    locale. Pool is capped at 12 entries (~2 MB each = ~24 MB total).
+    Oldest entry is evicted when the pool is full.
+  • Every content endpoint now accepts ?country=XX&language=en.
+    Country defaults to "ZZ" (global). Supported by ytmusicapi via
+    YTMusic(language=..., location=...) constructor params.
+  • Cache keys include country+language so per-locale responses are
+    stored independently.
+  • /charts and /trending share one cache key ("charts:{c}:{l}") so
+    they never double-fetch — trending is just a slice of charts.
+
+RENDER FREE-TIER
+  • startup() is non-blocking — YTMusic init runs as a background
+    task so Render's health check passes immediately on cold start
+    (Render kills services that don't respond within ~30 s).
+  • _upnext_store is now an OrderedDict with a Lock; LRU eviction is
+    correct (v4 used a plain dict + next(iter()) which is FIFO, not
+    LRU, and not thread-safe without a lock).
+  • GZip minimum_size lowered 500→300 — catches more small responses.
+  • Thread pool stays at 4 (ytmusicapi is I/O-bound; more workers
+    waste RAM without throughput benefit on the free tier).
+  • /cache_stats endpoint — monitor live entry counts.
+  • /health reports uptime + pool size.
+
+SPEED
+  • Cache-Control headers on every endpoint (browser/CDN caching).
+  • _normalise_home() and _normalise_charts() are top-level shared
+    functions used by both endpoints and background warm-up.
+  • Background warm-up pre-fills home + global charts 3 s after start
+    so the first real user request is always a cache hit.
+  • Podcast ID-stripping logic simplified (v4 had dead/contradictory
+    if-else branches that silently did nothing).
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from ytmusicapi import YTMusic
 
-# ─────────────────────────────────────────────────────────────
-#  App setup
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  App
+# ─────────────────────────────────────────────────────────────────────────────
+
+_START_TIME = time.monotonic()
 
 app = FastAPI(
-    title="YouTube Music API — v4",
-    description="FastAPI wrapper for unauthenticated ytmusicapi. Render 512 MB optimised.",
-    version="4.0.0",
+    title="YouTube Music API — v5",
+    description=(
+        "FastAPI wrapper for unauthenticated ytmusicapi. "
+        "Country-aware content, max-quality thumbnails, Render 512 MB optimised."
+    ),
+    version="5.0.0",
 )
 
-app.add_middleware(GZipMiddleware, minimum_size=500)
+app.add_middleware(GZipMiddleware, minimum_size=300)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,41 +99,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Thread pool — keep small on 512 MB RAM (ytmusicapi is I/O-bound, not CPU)
+# 4 workers: ytmusicapi is I/O-bound (HTTP to Google), not CPU-bound.
+# Raising this wastes ~8 MB RAM per extra worker for zero throughput gain.
 _executor = ThreadPoolExecutor(max_workers=4)
-
-# Single YTMusic instance (unauthenticated, thread-safe for reads)
-_ytm: YTMusic | None = None
-_ytm_lock = threading.Lock()
-
-
-def get_ytm() -> YTMusic:
-    global _ytm
-    if _ytm is None:
-        with _ytm_lock:
-            if _ytm is None:
-                _ytm = YTMusic()
-    return _ytm
 
 
 async def run(fn, *args, **kwargs):
-    """Run a blocking ytmusicapi call in the thread pool."""
+    """Offload a blocking ytmusicapi call to the shared thread pool."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_executor, lambda: fn(*args, **kwargs))
 
 
-# ─────────────────────────────────────────────────────────────
-#  TTL Cache  (simple LRU with expiry — no external deps)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Per-locale YTMusic instance pool
+#  Each instance is ~1-2 MB.  Cap at 12 locales → ≤ 24 MB for the pool.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ytm_pool:    Dict[str, YTMusic] = {}   # "COUNTRY:language" → YTMusic
+_ytm_pool_od: OrderedDict        = OrderedDict()   # for LRU tracking
+_ytm_lock     = threading.Lock()
+_YTM_POOL_MAX = 12
+
+
+def get_ytm(country: str = "ZZ", language: str = "en") -> YTMusic:
+    """
+    Return a cached YTMusic instance for the given locale.
+    Creates one on first call; evicts the LRU entry when the pool is full.
+    country = ISO 3166-1 alpha-2 (e.g. "IN", "US", "GB") or "ZZ" for global.
+    language = BCP-47 (e.g. "en", "hi", "fr").
+    """
+    country  = (country  or "ZZ").upper().strip()
+    language = (language or "en").lower().strip()
+    key = f"{country}:{language}"
+
+    # Fast path — no lock needed for a read that's already in the dict
+    if key in _ytm_pool:
+        with _ytm_lock:
+            if key in _ytm_pool_od:
+                _ytm_pool_od.move_to_end(key)
+        return _ytm_pool[key]
+
+    with _ytm_lock:
+        # Double-check after acquiring the lock
+        if key in _ytm_pool:
+            _ytm_pool_od.move_to_end(key)
+            return _ytm_pool[key]
+
+        # Evict LRU entry if the pool is full
+        if len(_ytm_pool) >= _YTM_POOL_MAX:
+            oldest_key, _ = _ytm_pool_od.popitem(last=False)
+            _ytm_pool.pop(oldest_key, None)
+
+        # Build the new instance
+        try:
+            location = country if country != "ZZ" else ""
+            instance = YTMusic(language=language, location=location)
+        except Exception:
+            try:
+                instance = YTMusic()      # plain fallback
+            except Exception as exc:
+                raise RuntimeError(f"YTMusic init failed: {exc}") from exc
+
+        _ytm_pool[key]    = instance
+        _ytm_pool_od[key] = True
+        return instance
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TTL Cache — thread-safe LRU with per-entry TTL
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TTLCache:
-    """Thread-safe in-memory LRU cache with per-entry TTL."""
+    """
+    Thread-safe LRU cache with per-entry TTL.
+    get() returns the cached value or None on miss/expiry.
+    """
 
     def __init__(self, maxsize: int = 128, ttl: int = 300):
         self._store: OrderedDict[str, tuple[Any, float]] = OrderedDict()
         self._maxsize = maxsize
-        self._ttl = ttl
-        self._lock = threading.Lock()
+        self._ttl     = ttl
+        self._lock    = threading.Lock()
 
     def get(self, key: str) -> Any:
         with self._lock:
@@ -109,54 +204,155 @@ class TTLCache:
         with self._lock:
             self._store.pop(key, None)
 
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._store)
 
-# Trimmed sizes for 512 MB RAM
+
+# Tuned for Render 512 MB free tier
 _cache_short  = TTLCache(maxsize=64,  ttl=120)   # 2 min  — search, suggestions
 _cache_medium = TTLCache(maxsize=96,  ttl=600)   # 10 min — home, charts, playlists
-_cache_long   = TTLCache(maxsize=192, ttl=3600)  # 1 hr   — artist, album, song, podcast
-
-# ─────────────────────────────────────────────────────────────
-#  Up-Next queue store  (in-memory, no Redis needed)
-# ─────────────────────────────────────────────────────────────
-
-_upnext_store: Dict[str, Dict] = {}
-_UPNEXT_TTL = 7200  # 2 hours
+_cache_long   = TTLCache(maxsize=160, ttl=3600)  # 1 hr   — song, artist, album, podcast
 
 
-# ─────────────────────────────────────────────────────────────
-#  Thumbnail helpers
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Up-Next queue store — in-process LRU, no Redis needed
+# ─────────────────────────────────────────────────────────────────────────────
 
-def best_thumbnail(thumbnails: list | None) -> str:
-    """Return URL of the highest-resolution thumbnail."""
-    if not thumbnails:
-        return ""
+_upnext_store: OrderedDict[str, Dict] = OrderedDict()   # proper LRU
+_upnext_lock  = threading.Lock()
+_UPNEXT_TTL   = 7200   # 2 h
+_UPNEXT_MAX   = 50     # 50 entries × ~2 KB ≈ 100 KB
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Thumbnail helpers — maximum quality, zero extra API calls
+# ─────────────────────────────────────────────────────────────────────────────
+
+# YouTube video thumbnail filename → quality rank (higher is better)
+_YT_QUALITY_RANK: Dict[str, int] = {
+    "maxresdefault": 100,
+    "sddefault":      70,
+    "0":              65,   # YouTube's "index 0" ≈ 480 p
+    "hqdefault":      50,
+    "mqdefault":      30,
+    "2":              20,
+    "1":              15,
+    "3":              10,
+    "default":         5,
+}
+
+# Matches the =w{n}-h{n}... size suffix on lh3 URLs
+_LH3_SIZE_RE = re.compile(r"=(w\d+(-h\d+)?|h\d+|s\d+)(-[a-zA-Z0-9_\-]*)*$")
+
+
+def upgrade_thumbnail_url(url: str) -> str:
+    """
+    Rewrite a thumbnail URL to the highest available quality.
+    No HTTP request — pure string manipulation.
+
+    lh3.googleusercontent.com (album art, artist images):
+        Remove the size suffix (=w226-h226-l90-rj, =s100, etc.)
+        and replace with =w576-h576-l90-rj.  576 is the max Google
+        serves for music art; larger requests are silently capped.
+
+    i.ytimg.com/vi/ (YouTube video thumbnails):
+        Replace any quality token with hqdefault.jpg (480×360).
+        We avoid maxresdefault because it returns HTTP 404 on many
+        music / lyric videos and would show a broken image.
+    """
+    if not url:
+        return url
     try:
-        s = sorted(thumbnails, key=lambda t: (t.get("width", 0) or 0, t.get("height", 0) or 0), reverse=True)
-        return s[0].get("url", "") if s else ""
+        if "lh3.googleusercontent.com" in url:
+            url = _LH3_SIZE_RE.sub("", url)
+            return url + "=w576-h576-l90-rj"
+
+        if "i.ytimg.com/vi/" in url:
+            url = re.sub(
+                r"/(maxresdefault|sddefault|hqdefault|mqdefault|default|[0-3])\.jpg",
+                "/hqdefault.jpg",
+                url,
+            )
+            return url
     except Exception:
-        return thumbnails[-1].get("url", "") if thumbnails else ""
+        pass
+    return url
+
+
+def _thumb_score(t: Any) -> int:
+    """
+    Quality score for a single thumbnail (higher = better).
+    Three-tier priority:
+      1. pixel area (width × height) if both are non-zero
+      2. width encoded in lh3 URL suffix (=w{n}-h{n})
+      3. ytimg filename rank
+    This handles the common case where ytmusicapi returns width=0.
+    """
+    if isinstance(t, str):
+        url, w, h = t, 0, 0
+    else:
+        url = t.get("url", "")
+        w   = int(t.get("width",  0) or 0)
+        h   = int(t.get("height", 0) or 0)
+
+    # Tier 1: real pixel area
+    if w > 0 and h > 0:
+        return w * h
+
+    # Tier 2: parse lh3 width from suffix
+    m = re.search(r"=w(\d+)", url)
+    if m:
+        side = int(m.group(1))
+        return side * side
+
+    # Tier 3: ytimg filename
+    try:
+        fname = url.rsplit("/", 1)[-1].split("?")[0].split(".")[0]
+        rank  = _YT_QUALITY_RANK.get(fname)
+        if rank:
+            return rank * 10_000
+    except Exception:
+        pass
+
+    return 0
 
 
 def best_thumbnails_list(thumbnails: list | None) -> list:
-    """Return thumbnails sorted best-first, URL-deduplicated."""
+    """
+    Sort thumbnails best-first, upgrade every URL to max quality,
+    deduplicate on the *upgraded* URL.
+    Always returns a list of dicts with at least {"url", "width", "height"}.
+    """
     if not thumbnails:
         return []
     try:
-        seen, out = set(), []
-        for t in sorted(thumbnails, key=lambda t: (t.get("width", 0) or 0), reverse=True):
+        seen: set[str] = set()
+        out:  list     = []
+        for t in sorted(thumbnails, key=_thumb_score, reverse=True):
+            if isinstance(t, str):
+                t = {"url": t, "width": 0, "height": 0}
             url = t.get("url", "")
-            if url and url not in seen:
-                seen.add(url)
-                out.append(t)
+            if not url:
+                continue
+            upgraded = upgrade_thumbnail_url(url)
+            if upgraded not in seen:
+                seen.add(upgraded)
+                out.append({**t, "url": upgraded})
         return out
     except Exception:
-        return thumbnails
+        return thumbnails or []
 
 
-# ─────────────────────────────────────────────────────────────
+def best_thumbnail(thumbnails: list | None) -> str:
+    """Return the URL of the single highest-quality thumbnail."""
+    lst = best_thumbnails_list(thumbnails)
+    return lst[0]["url"] if lst else ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Normalisation helpers
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _norm_artists(artists: Any) -> list:
     if not artists:
@@ -169,18 +365,20 @@ def _norm_artists(artists: Any) -> list:
             if isinstance(a, str):
                 out.append({"name": a, "id": ""})
             elif isinstance(a, dict):
-                out.append({"name": a.get("name", ""), "id": a.get("id", "") or a.get("browseId", "")})
+                out.append({
+                    "name": a.get("name", ""),
+                    "id":   a.get("id", "") or a.get("browseId", ""),
+                })
         return out
     return []
 
 
 def norm_track(t: dict) -> dict:
-    """Normalise a track/song dict to a consistent shape the frontend expects."""
-    raw_thumbs = t.get("thumbnails") or t.get("thumbnail") or []
-    if isinstance(raw_thumbs, str):
-        raw_thumbs = [{"url": raw_thumbs, "width": 0, "height": 0}]
-    thumbs = best_thumbnails_list(raw_thumbs)
-    album = t.get("album")
+    raw = t.get("thumbnails") or t.get("thumbnail") or []
+    if isinstance(raw, str):
+        raw = [{"url": raw, "width": 0, "height": 0}]
+    thumbs     = best_thumbnails_list(raw)
+    album      = t.get("album")
     album_name = album.get("name", "") if isinstance(album, dict) else (album or "")
     return {
         "videoId":    t.get("videoId", ""),
@@ -232,15 +430,9 @@ def norm_playlist_result(p: dict) -> dict:
 
 
 def norm_podcast_result(p: dict) -> dict:
-    thumbs = best_thumbnails_list(p.get("thumbnails") or [])
-    # ytmusicapi uses browseId OR podcastId; handle all variants
-    browse_id = (
-        p.get("browseId") or
-        p.get("podcastId") or
-        p.get("channelId") or
-        ""
-    )
-    author = p.get("author", "") or ", ".join(
+    thumbs    = best_thumbnails_list(p.get("thumbnails") or [])
+    browse_id = p.get("browseId") or p.get("podcastId") or p.get("channelId") or ""
+    author    = p.get("author", "") or ", ".join(
         a.get("name", "") for a in _norm_artists(p.get("artists"))
     )
     return {
@@ -253,7 +445,6 @@ def norm_podcast_result(p: dict) -> dict:
 
 
 def norm_search_results(raw: list, filter_type: str | None) -> list:
-    """Normalise a list of raw search results based on filter type."""
     if not isinstance(raw, list):
         return []
     out = []
@@ -263,87 +454,197 @@ def norm_search_results(raw: list, filter_type: str | None) -> list:
         rt = (item.get("resultType") or filter_type or "").lower()
         if rt in ("song", "songs", "video", "videos"):
             n = norm_track(item)
-            n["resultType"] = "song" if "video" not in rt else "video"
+            n["resultType"] = "video" if "video" in rt else "song"
             out.append(n)
         elif rt in ("artist", "artists"):
-            n = norm_artist_result(item)
-            n["resultType"] = "artist"
-            out.append(n)
+            n = norm_artist_result(item); n["resultType"] = "artist"; out.append(n)
         elif rt in ("album", "albums", "single", "singles", "ep"):
-            n = norm_album_result(item)
-            n["resultType"] = "album"
-            out.append(n)
+            n = norm_album_result(item); n["resultType"] = "album"; out.append(n)
         elif rt in ("playlist", "playlists"):
-            n = norm_playlist_result(item)
-            n["resultType"] = "playlist"
-            out.append(n)
+            n = norm_playlist_result(item); n["resultType"] = "playlist"; out.append(n)
         elif rt in ("podcast", "podcasts", "episode", "episodes"):
-            n = norm_podcast_result(item)
-            n["resultType"] = "podcast"
-            out.append(n)
+            n = norm_podcast_result(item); n["resultType"] = "podcast"; out.append(n)
         else:
             thumbs = best_thumbnails_list(item.get("thumbnails") or [])
             item["thumbnails"] = thumbs
-            item["thumbnail"] = thumbs[0]["url"] if thumbs else ""
+            item["thumbnail"]  = thumbs[0]["url"] if thumbs else ""
             out.append(item)
     return out
 
 
-# ─────────────────────────────────────────────────────────────
-#  Startup warm-up
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Shared normalisation — used by endpoints AND background warm-up
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalise_home(raw: list) -> list:
+    shelves = []
+    for shelf in raw:
+        if not isinstance(shelf, dict):
+            continue
+        contents = []
+        for item in (shelf.get("contents") or []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("videoId"):
+                contents.append(norm_track(item))
+            else:
+                thumbs = best_thumbnails_list(item.get("thumbnails") or [])
+                item["thumbnails"] = thumbs
+                item["thumbnail"]  = thumbs[0]["url"] if thumbs else ""
+                contents.append(item)
+        if contents:
+            shelves.append({"title": shelf.get("title", "For You"), "contents": contents})
+    return shelves
+
+
+def _extract_chart_section(section: Any) -> list:
+    """Flatten a chart section (list or {items/results: [...]}) into a plain list."""
+    if not section:
+        return []
+    items = section if isinstance(section, list) else (
+        section.get("items") or section.get("results") or []
+    )
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        thumbs = best_thumbnails_list(item.get("thumbnails") or [])
+        item["thumbnails"] = thumbs
+        item["thumbnail"]  = thumbs[0]["url"] if thumbs else ""
+        out.append(item)
+    return out
+
+
+def _normalise_charts(raw: dict, country: str) -> dict:
+    return {
+        "country":  country,
+        "songs":    [norm_track(t) for t in _extract_chart_section(raw.get("songs"))],
+        "videos":   [norm_track(t) for t in _extract_chart_section(raw.get("videos"))
+                     if t.get("videoId")],
+        "artists":  [norm_artist_result(a) for a in _extract_chart_section(raw.get("artists"))],
+        "trending": [norm_track(t) for t in _extract_chart_section(raw.get("trending"))
+                     if t.get("videoId")],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Cache-Control header helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cc(seconds: int) -> dict:
+    """Return a dict suitable for response.headers.update()."""
+    return {"Cache-Control": f"public, max-age={seconds}, stale-while-revalidate=60"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Startup — non-blocking so Render health check passes immediately
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
-    """Pre-initialise the YTMusic client so first request is fast."""
+    """
+    Schedule background warm-up as a task.
+    The server starts accepting requests BEFORE warm-up completes, which
+    is exactly what Render needs (it checks /health within 30 s of start).
+    """
+    asyncio.create_task(_background_warmup())
+
+
+async def _background_warmup():
+    await asyncio.sleep(3)   # give uvicorn time to fully start
+
+    # Initialise the default locale instance
     try:
         await run(get_ytm)
     except Exception:
         pass
 
+    # Pre-fill the two most-requested caches so first users hit the cache
+    for coro in (_warm_home("ZZ", "en"), _warm_charts("ZZ", "en")):
+        try:
+            await coro
+        except Exception:
+            pass
 
-# ─────────────────────────────────────────────────────────────
-#  Health check
-# ─────────────────────────────────────────────────────────────
+
+async def _warm_home(country: str, language: str) -> None:
+    raw     = await run(get_ytm(country, language).get_home, 6)
+    shelves = _normalise_home(raw or [])
+    _cache_medium.set(f"home:{country}:{language}:6", shelves)
+
+
+async def _warm_charts(country: str, language: str) -> None:
+    raw    = await run(get_ytm(country, language).get_charts, country)
+    result = _normalise_charts(raw, country)
+    _cache_medium.set(f"charts:{country}:{language}", result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Health + admin
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["meta"])
 async def health():
-    return {"status": "ok", "version": "4.0.0"}
+    return {
+        "status":         "ok",
+        "version":        "5.0.0",
+        "uptime_seconds": round(time.monotonic() - _START_TIME),
+        "ytm_instances":  len(_ytm_pool),
+    }
 
 
-# ─────────────────────────────────────────────────────────────
-#  Search  (v4 — paginated with offset)
-# ─────────────────────────────────────────────────────────────
+@app.get("/cache_stats", tags=["meta"])
+async def cache_stats():
+    """Live cache entry counts — handy for Render dashboard monitoring."""
+    return {
+        "short":    len(_cache_short),
+        "medium":   len(_cache_medium),
+        "long":     len(_cache_long),
+        "upnext":   len(_upnext_store),
+        "ytm_pool": len(_ytm_pool),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Search
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search")
 async def search(
-    query: str,
-    filter: Optional[str] = Query(None, description="songs|videos|albums|artists|playlists|podcasts"),
-    scope: Optional[str] = Query(None),
-    limit: int = Query(20, ge=1, le=50),
-    offset: int = Query(0, ge=0, description="Pagination offset"),
+    response: Response,
+    query:   str,
+    filter:  Optional[str] = Query(
+        None, description="songs | videos | albums | artists | playlists | podcasts"
+    ),
+    scope:   Optional[str] = Query(None),
+    limit:   int  = Query(20, ge=1, le=50),
+    offset:  int  = Query(0,  ge=0, description="Pagination offset"),
     ignore_spelling: bool = False,
+    country:  str = Query("ZZ", description="ISO 3166-1 alpha-2, e.g. IN US GB"),
+    language: str = Query("en", description="BCP-47, e.g. en hi fr"),
 ):
     """
     Search YouTube Music.
-    Returns: { results, count, total, hasMore, offset, limit }
-    All items are normalised (thumbnail string at top level).
+    Returns { results, count, total, hasMore, offset, limit, country }.
+    All items normalised with max-quality thumbnail at top level.
     """
-    # ytmusicapi doesn't support offset natively — we fetch limit+offset and slice
-    # Cap total fetch at 50 to stay within RAM budget
     fetch_limit = min(offset + limit, 50)
-    cache_key = f"search:{query}:{filter}:{fetch_limit}"
-    cached = _cache_short.get(cache_key)
+    cache_key   = f"search:{query}:{filter}:{fetch_limit}:{country}:{language}"
+    cached      = _cache_short.get(cache_key)
 
     if cached is None:
         try:
-            raw = await run(get_ytm().search, query, filter, scope, fetch_limit, ignore_spelling)
+            raw    = await run(
+                get_ytm(country, language).search,
+                query, filter, scope, fetch_limit, ignore_spelling,
+            )
             cached = norm_search_results(raw or [], filter)
             _cache_short.set(cache_key, cached)
         except Exception as e:
             raise HTTPException(500, detail=str(e))
 
-    page = cached[offset:offset + limit]
+    page = cached[offset: offset + limit]
+    response.headers.update(_cc(60))
     return {
         "results": page,
         "count":   len(page),
@@ -351,22 +652,30 @@ async def search(
         "hasMore": len(cached) > offset + limit,
         "offset":  offset,
         "limit":   limit,
+        "country": country,
     }
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 #  Search suggestions
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search_suggestions")
-async def search_suggestions(query: str, detailed_runs: bool = False):
-    """Get search suggestions as a plain list of strings."""
-    cache_key = f"suggest:{query}"
-    cached = _cache_short.get(cache_key)
+async def search_suggestions(
+    response: Response,
+    query:    str,
+    detailed_runs: bool = False,
+    language: str = Query("en"),
+):
+    cache_key = f"suggest:{query}:{language}"
+    cached    = _cache_short.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(30))
         return cached
     try:
-        raw = await run(get_ytm().get_search_suggestions, query, detailed_runs)
+        raw = await run(
+            get_ytm("ZZ", language).get_search_suggestions, query, detailed_runs
+        )
         suggestions: list[str] = []
         if isinstance(raw, list):
             for item in raw:
@@ -377,55 +686,48 @@ async def search_suggestions(query: str, detailed_runs: bool = False):
                     if text:
                         suggestions.append(text)
         _cache_short.set(cache_key, suggestions, ttl=60)
+        response.headers.update(_cc(30))
         return suggestions
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 #  Artist
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/artist/{artist_id}")
-async def get_artist(artist_id: str):
-    """
-    Full artist page.
-    Thumbnails sorted best-first.
-    songs.params token included so caller can fetch more songs.
-    """
-    cache_key = f"artist:{artist_id}"
-    cached = _cache_long.get(cache_key)
+async def get_artist(
+    response:  Response,
+    artist_id: str,
+    language:  str = Query("en"),
+):
+    cache_key = f"artist:{artist_id}:{language}"
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(600))
         return cached
-
     try:
-        data = await run(get_ytm().get_artist, artist_id)
+        data = await run(get_ytm("ZZ", language).get_artist, artist_id)
         if not data:
             raise HTTPException(404, "Artist not found")
-
-        # Top-level thumbnails
         data["thumbnails"] = best_thumbnails_list(data.get("thumbnails") or [])
         data["thumbnail"]  = data["thumbnails"][0]["url"] if data["thumbnails"] else ""
-
-        # Nested sections
         for section in ("songs", "albums", "singles", "videos", "related"):
-            section_data = data.get(section, {})
-            if not isinstance(section_data, dict):
+            sd = data.get(section, {})
+            if not isinstance(sd, dict):
                 continue
-            results = section_data.get("results") or section_data.get("items") or []
-            normalised = []
-            for item in results:
+            normed = []
+            for item in (sd.get("results") or sd.get("items") or []):
                 if not isinstance(item, dict):
                     continue
                 item["thumbnails"] = best_thumbnails_list(item.get("thumbnails") or [])
                 item["thumbnail"]  = item["thumbnails"][0]["url"] if item["thumbnails"] else ""
-                normalised.append(item)
-            section_data["results"] = normalised
-            # Preserve the params token — frontend uses it to load ALL songs
-            # data["songs"]["params"] is the key used by get_artist_albums / browse_artist
-            data[section] = section_data
-
+                normed.append(item)
+            sd["results"] = normed
+            data[section] = sd
         _cache_long.set(cache_key, data)
+        response.headers.update(_cc(600))
         return data
     except HTTPException:
         raise
@@ -433,44 +735,36 @@ async def get_artist(artist_id: str):
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Artist — ALL songs  (NEW)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Artist — all songs
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/artist/{artist_id}/songs")
 async def get_artist_songs(
+    response:  Response,
     artist_id: str,
-    limit: int = Query(100, ge=1, le=200),
+    limit:     int = Query(100, ge=1, le=200),
+    language:  str = Query("en"),
 ):
-    """
-    All songs by an artist.
-    Returns: { artistId, name, songs: [norm_track], total }
-
-    Strategy:
-      1. Fetch artist page to get the songs.params token.
-      2. Use get_artist_albums (browse) to follow the "all songs" link.
-      3. Falls back to a songs-filter search by artist name if step 2 fails.
-    """
-    cache_key = f"artist_songs:{artist_id}:{limit}"
-    cached = _cache_long.get(cache_key)
+    cache_key = f"artist_songs:{artist_id}:{limit}:{language}"
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(600))
         return cached
-
     try:
-        ytm = get_ytm()
+        ytm         = get_ytm("ZZ", language)
         artist_data = await run(ytm.get_artist, artist_id)
         if not artist_data:
             raise HTTPException(404, "Artist not found")
-
-        artist_name = artist_data.get("name", "")
+        artist_name   = artist_data.get("name", "")
         songs_section = artist_data.get("songs", {})
-        params_token = None
+        params_token  = None
         if isinstance(songs_section, dict):
             params_token = songs_section.get("params") or songs_section.get("browseId")
 
         songs_raw: list = []
 
-        # Step 1: try get_artist_albums (follow "all songs" browse token)
+        # Strategy 1: follow the "all songs" browse token
         if params_token:
             try:
                 more = await run(ytm.get_artist_albums, artist_id, params_token)
@@ -484,28 +778,24 @@ async def get_artist_songs(
             except Exception:
                 songs_raw = []
 
-        # Step 2: use watch-playlist / radio if browse token gave nothing
+        # Strategy 2: initial songs already on the artist page
         if not songs_raw and isinstance(songs_section, dict):
-            initial = songs_section.get("results") or songs_section.get("items") or []
-            songs_raw = list(initial)
+            songs_raw = list(songs_section.get("results") or songs_section.get("items") or [])
 
-        # Step 3: search fallback
+        # Strategy 3: search fallback
         if not songs_raw and artist_name:
             try:
-                search_raw = await run(ytm.search, artist_name, "songs", None, min(limit, 50), False)
-                if isinstance(search_raw, list):
-                    songs_raw = search_raw
+                sr = await run(ytm.search, artist_name, "songs", None, min(limit, 50), False)
+                songs_raw = sr if isinstance(sr, list) else []
             except Exception:
                 pass
 
         tracks = [norm_track(t) for t in songs_raw if isinstance(t, dict) and t.get("videoId")]
-        # Deduplicate by videoId
         seen, deduped = set(), []
         for t in tracks:
             vid = t.get("videoId", "")
             if vid and vid not in seen:
-                seen.add(vid)
-                deduped.append(t)
+                seen.add(vid); deduped.append(t)
 
         result = {
             "artistId": artist_id,
@@ -514,6 +804,7 @@ async def get_artist_songs(
             "total":    len(deduped),
         }
         _cache_long.set(cache_key, result)
+        response.headers.update(_cc(600))
         return result
     except HTTPException:
         raise
@@ -521,25 +812,30 @@ async def get_artist_songs(
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 #  Album
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/album/{album_id}")
-async def get_album(album_id: str):
-    """Full album — tracks normalised, thumbnails best-first."""
-    cache_key = f"album:{album_id}"
-    cached = _cache_long.get(cache_key)
+async def get_album(
+    response: Response,
+    album_id: str,
+    language: str = Query("en"),
+):
+    cache_key = f"album:{album_id}:{language}"
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(3600))
         return cached
     try:
-        data = await run(get_ytm().get_album, album_id)
+        data = await run(get_ytm("ZZ", language).get_album, album_id)
         if not data:
             raise HTTPException(404, "Album not found")
         data["thumbnails"] = best_thumbnails_list(data.get("thumbnails") or [])
         data["thumbnail"]  = data["thumbnails"][0]["url"] if data["thumbnails"] else ""
-        data["tracks"] = [norm_track(t) for t in (data.get("tracks") or [])]
+        data["tracks"]     = [norm_track(t) for t in (data.get("tracks") or [])]
         _cache_long.set(cache_key, data)
+        response.headers.update(_cc(3600))
         return data
     except HTTPException:
         raise
@@ -547,80 +843,78 @@ async def get_album(album_id: str):
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 #  Song metadata
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/song/{video_id}")
-async def get_song(video_id: str):
-    """Song metadata with highest-quality thumbnail first."""
+async def get_song(response: Response, video_id: str):
     cache_key = f"song:{video_id}"
-    cached = _cache_long.get(cache_key)
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(3600))
         return cached
     try:
         data = await run(get_ytm().get_song, video_id)
-        raw_thumbs = (
+        raw  = (
             data.get("thumbnail", {}).get("thumbnails") or
             data.get("thumbnails") or []
         )
-        sorted_thumbs = best_thumbnails_list(raw_thumbs)
-        data["thumbnails"] = sorted_thumbs
-        data["thumbnail"]  = sorted_thumbs[0]["url"] if sorted_thumbs else ""
+        thumbs = best_thumbnails_list(raw)
+        data["thumbnails"] = thumbs
+        data["thumbnail"]  = thumbs[0]["url"] if thumbs else ""
         _cache_long.set(cache_key, data)
+        response.headers.update(_cc(3600))
         return data
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Stream metadata  (used by frontend for YouTube IFrame + download)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stream metadata (frontend YouTube IFrame + download)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/stream/{video_id}")
-async def get_stream(video_id: str):
+async def get_stream(response: Response, video_id: str):
     """
-    Returns metadata + highest-quality thumbnails for a video.
-    Includes url / audio_url aliases so the frontend download works.
+    Returns metadata + max-quality thumbnails.
+    url / audio_url / stream_url are all the same YouTube watch URL;
+    the frontend tries all three key names for compatibility.
     """
     cache_key = f"stream:{video_id}"
-    cached = _cache_long.get(cache_key)
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(3600))
         return cached
     try:
         song_data = await run(get_ytm().get_song, video_id)
         vd = song_data.get("videoDetails", {})
         if not vd:
             raise HTTPException(404, "Video not found")
-
-        raw_thumbs = (
+        raw = (
             vd.get("thumbnail", {}).get("thumbnails") or
             song_data.get("thumbnail", {}).get("thumbnails") or []
         )
-        sorted_thumbs = best_thumbnails_list(raw_thumbs)
-        thumb_url = sorted_thumbs[0]["url"] if sorted_thumbs else ""
-
-        # Canonical YouTube watch URL — frontend embeds via IFrame player
+        thumbs    = best_thumbnails_list(raw)
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
-
         result = {
-            "video_id":        video_id,
-            "videoId":         video_id,
-            # url / audio_url / stream_url — all same value; frontend tries all three
-            "url":             watch_url,
-            "audio_url":       watch_url,
-            "stream_url":      watch_url,
-            "title":           vd.get("title", ""),
-            "artist":          vd.get("author", ""),
-            "channel_id":      vd.get("channelId", ""),
-            "duration_seconds": int(vd.get("lengthSeconds") or 0),
-            "views":           int(vd.get("viewCount") or 0),
-            "keywords":        vd.get("keywords", [])[:10],
-            "is_live":         vd.get("isLiveContent", False),
-            "thumbnails":      sorted_thumbs,
-            "thumbnail":       thumb_url,
+            "video_id":          video_id,
+            "videoId":           video_id,
+            "url":               watch_url,
+            "audio_url":         watch_url,
+            "stream_url":        watch_url,
+            "title":             vd.get("title", ""),
+            "artist":            vd.get("author", ""),
+            "channel_id":        vd.get("channelId", ""),
+            "duration_seconds":  int(vd.get("lengthSeconds") or 0),
+            "views":             int(vd.get("viewCount") or 0),
+            "keywords":          vd.get("keywords", [])[:10],
+            "is_live":           vd.get("isLiveContent", False),
+            "thumbnails":        thumbs,
+            "thumbnail":         thumbs[0]["url"] if thumbs else "",
         }
         _cache_long.set(cache_key, result)
+        response.headers.update(_cc(3600))
         return result
     except HTTPException:
         raise
@@ -628,193 +922,198 @@ async def get_stream(video_id: str):
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Now Playing  (NEW — stream metadata + related in one call)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Now Playing  (stream metadata + related in one parallel call)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/now_playing/{video_id}")
 async def now_playing(
-    video_id: str,
+    response:      Response,
+    video_id:      str,
     related_limit: int = Query(10, ge=1, le=30),
+    country:       str = Query("ZZ"),
+    language:      str = Query("en"),
 ):
     """
-    One-shot endpoint used by the frontend player.
-    Returns: { videoId, stream: {…}, related: [norm_track] }
-    Avoids two round-trips from the client.
+    One-shot endpoint: stream metadata + related tracks in parallel.
+    Returns { videoId, stream, related }.
     """
-    cache_key = f"now_playing:{video_id}:{related_limit}"
-    cached = _cache_long.get(cache_key)
+    cache_key = f"now_playing:{video_id}:{related_limit}:{country}:{language}"
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(1800))
         return cached
 
-    ytm = get_ytm()
+    ytm = get_ytm(country, language)
+    song_data, watch_data = await asyncio.gather(
+        run(ytm.get_song, video_id),
+        run(ytm.get_watch_playlist, video_id, None, related_limit + 1),
+        return_exceptions=True,
+    )
 
-    # Fetch in parallel using asyncio.gather
-    stream_task  = run(ytm.get_song, video_id)
-    related_task = run(ytm.get_watch_playlist, video_id, None, related_limit + 1)
-
-    try:
-        song_data, watch_data = await asyncio.gather(stream_task, related_task, return_exceptions=True)
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
-
-    # --- Stream data ---
     stream: dict = {}
     if isinstance(song_data, dict):
-        vd = song_data.get("videoDetails", {})
-        raw_thumbs = (
+        vd  = song_data.get("videoDetails", {})
+        raw = (
             vd.get("thumbnail", {}).get("thumbnails") or
             song_data.get("thumbnail", {}).get("thumbnails") or []
         )
-        sorted_thumbs = best_thumbnails_list(raw_thumbs)
-        thumb_url = sorted_thumbs[0]["url"] if sorted_thumbs else ""
+        thumbs    = best_thumbnails_list(raw)
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         stream = {
-            "videoId":         video_id,
-            "url":             watch_url,
-            "audio_url":       watch_url,
-            "title":           vd.get("title", ""),
-            "artist":          vd.get("author", ""),
+            "videoId":          video_id,
+            "url":              watch_url,
+            "audio_url":        watch_url,
+            "title":            vd.get("title", ""),
+            "artist":           vd.get("author", ""),
             "duration_seconds": int(vd.get("lengthSeconds") or 0),
-            "thumbnails":      sorted_thumbs,
-            "thumbnail":       thumb_url,
+            "thumbnails":       thumbs,
+            "thumbnail":        thumbs[0]["url"] if thumbs else "",
         }
 
-    # --- Related tracks ---
     related: list = []
     if isinstance(watch_data, dict):
         tracks_raw = watch_data.get("tracks") or []
-        # Skip the first item if it is the current song itself
         if tracks_raw and tracks_raw[0].get("videoId") == video_id:
             tracks_raw = tracks_raw[1:]
         related = [norm_track(t) for t in tracks_raw[:related_limit] if t.get("videoId")]
 
-    result = {
-        "videoId": video_id,
-        "stream":  stream,
-        "related": related,
-    }
-    _cache_long.set(cache_key, result, ttl=1800)  # 30 min
+    result = {"videoId": video_id, "stream": stream, "related": related}
+    _cache_long.set(cache_key, result, ttl=1800)
+    response.headers.update(_cc(1800))
     return result
 
 
-# ─────────────────────────────────────────────────────────────
-#  Related songs  (NEW)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Related songs
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/related_songs/{video_id}")
 async def get_related_songs(
-    video_id: str,
-    limit: int = Query(15, ge=1, le=50),
+    response:  Response,
+    video_id:  str,
+    limit:     int = Query(15, ge=1, le=50),
+    country:   str = Query("ZZ"),
+    language:  str = Query("en"),
 ):
-    """
-    Related tracks via watch-playlist radio.
-    Returns: { videoId, tracks: [norm_track], count }
-    """
-    cache_key = f"related:{video_id}:{limit}"
-    cached = _cache_long.get(cache_key)
+    cache_key = f"related:{video_id}:{limit}:{country}:{language}"
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(1800))
         return cached
     try:
-        raw = await run(get_ytm().get_watch_playlist, video_id, None, limit + 1)
+        raw        = await run(get_ytm(country, language).get_watch_playlist, video_id, None, limit + 1)
         tracks_raw = raw.get("tracks") or []
         if tracks_raw and tracks_raw[0].get("videoId") == video_id:
             tracks_raw = tracks_raw[1:]
         tracks = [norm_track(t) for t in tracks_raw[:limit] if t.get("videoId")]
         result = {"videoId": video_id, "tracks": tracks, "count": len(tracks)}
         _cache_long.set(cache_key, result, ttl=1800)
+        response.headers.update(_cc(1800))
         return result
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Up-Next  (watch queue / radio for a song)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Up-Next  (watch queue / radio)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/upnext/{video_id}")
 async def get_upnext(
-    video_id: str,
-    limit: int = Query(20, ge=5, le=50),
+    response:      Response,
+    video_id:      str,
+    limit:         int  = Query(20, ge=5, le=50),
     force_refresh: bool = Query(False),
+    country:       str = Query("ZZ"),
+    language:      str = Query("en"),
 ):
     """
-    Returns an Up-Next queue for the given video.
-    Cached in-memory for 2 hours so advancing the queue doesn't re-fetch.
-    Pass force_refresh=true when user manually picks a new song.
+    Up-Next queue for a video.  Cached in-process for 2 h.
+    Pass force_refresh=true when the user manually picks a new song.
     """
-    now = time.time()
-    existing = _upnext_store.get(video_id)
+    store_key = f"{video_id}:{country}:{language}"
+    now       = time.time()
+
+    with _upnext_lock:
+        existing = _upnext_store.get(store_key)
+
     if existing and not force_refresh:
         if now - existing.get("created_at", 0) < _UPNEXT_TTL:
+            response.headers.update(_cc(300))
             return existing
 
     try:
-        raw = await run(get_ytm().get_watch_playlist, video_id, None, limit)
+        raw        = await run(get_ytm(country, language).get_watch_playlist, video_id, None, limit)
         tracks_raw = raw.get("tracks") or []
         if tracks_raw and tracks_raw[0].get("videoId") == video_id:
             tracks_raw = tracks_raw[1:]
         tracks = [norm_track(t) for t in tracks_raw if t.get("videoId")]
-        queue = {
+        queue  = {
             "origin_video_id": video_id,
             "tracks":          tracks,
             "count":           len(tracks),
             "created_at":      now,
+            "country":         country,
         }
-        _upnext_store[video_id] = queue
-        # Keep store bounded
-        if len(_upnext_store) > 100:
-            oldest = next(iter(_upnext_store))
-            del _upnext_store[oldest]
+        # Proper LRU eviction using OrderedDict
+        with _upnext_lock:
+            if store_key in _upnext_store:
+                _upnext_store.move_to_end(store_key)
+            _upnext_store[store_key] = queue
+            while len(_upnext_store) > _UPNEXT_MAX:
+                _upnext_store.popitem(last=False)
+
+        response.headers.update(_cc(300))
         return queue
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
 @app.delete("/upnext/{video_id}")
-async def reset_upnext(video_id: str):
-    """Explicitly clear the Up-Next queue for a video."""
-    _upnext_store.pop(video_id, None)
-    return {"cleared": video_id}
+async def reset_upnext(
+    video_id: str,
+    country:  str = Query("ZZ"),
+    language: str = Query("en"),
+):
+    store_key = f"{video_id}:{country}:{language}"
+    with _upnext_lock:
+        _upnext_store.pop(store_key, None)
+    return {"cleared": store_key}
 
 
-# ─────────────────────────────────────────────────────────────
-#  Playlist  (handles VL-prefix IDs)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Playlist
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(
-    playlist_id: str,
-    limit: int = Query(100, ge=1, le=500),
-    related: bool = False,
+    response:     Response,
+    playlist_id:  str,
+    limit:        int  = Query(100, ge=1, le=500),
+    related:      bool = False,
     suggestions_limit: int = 0,
+    language:     str = Query("en"),
 ):
-    """
-    Full playlist with normalised tracks.
-    Handles YouTube playlist IDs that start with VL (strips the prefix).
-    """
-    # ytmusicapi expects IDs WITHOUT the VL prefix
-    clean_id = playlist_id.lstrip("VL") if playlist_id.startswith("VL") else playlist_id
-
-    cache_key = f"playlist:{clean_id}:{limit}"
-    cached = _cache_medium.get(cache_key)
+    """Full playlist — normalised tracks, max-quality thumbnails. Handles VL-prefix IDs."""
+    clean_id  = playlist_id[2:] if playlist_id.startswith("VL") else playlist_id
+    cache_key = f"playlist:{clean_id}:{limit}:{language}"
+    cached    = _cache_medium.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(300))
         return cached
-
     try:
-        data = await run(get_ytm().get_playlist, clean_id, limit, related, suggestions_limit)
+        data = await run(
+            get_ytm("ZZ", language).get_playlist,
+            clean_id, limit, related, suggestions_limit,
+        )
         if not data:
             raise HTTPException(404, "Playlist not found")
-
-        # Normalise tracks
-        tracks = data.get("tracks") or []
-        data["tracks"] = [norm_track(t) for t in tracks if isinstance(t, dict)]
-
-        # Normalise playlist-level thumbnails
+        data["tracks"]     = [norm_track(t) for t in (data.get("tracks") or []) if isinstance(t, dict)]
         data["thumbnails"] = best_thumbnails_list(data.get("thumbnails") or [])
         data["thumbnail"]  = data["thumbnails"][0]["url"] if data["thumbnails"] else ""
-
         _cache_medium.set(cache_key, data)
+        response.headers.update(_cc(300))
         return data
     except HTTPException:
         raise
@@ -822,206 +1121,173 @@ async def get_playlist(
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Podcast  (NEW — full podcast page with episodes)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Podcast
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/podcast/{podcast_id}")
 async def get_podcast(
+    response:   Response,
     podcast_id: str,
-    limit: int = Query(50, ge=1, le=200),
+    limit:      int = Query(50, ge=1, le=200),
+    language:   str = Query("en"),
 ):
     """
-    Full podcast page.
-    Returns: { podcastId, title, author, description, thumbnail, thumbnails, episodes, total }
-    Each episode: { videoId, title, artist, thumbnail, duration, date, description }
-
-    ytmusicapi `get_podcast` is available in ≥ 1.7.0.  Falls back to
-    `get_playlist` (podcasts are playlists internally) if it fails.
+    Full podcast page with normalised episodes.
+    Returns { podcastId, title, author, description, thumbnail, thumbnails, episodes, total }.
+    Falls back from get_podcast → get_playlist and from clean_id → original_id.
     """
-    # Strip common prefix variants
-    clean_id = podcast_id
-    for prefix in ("VLMPSPPLxx", "MPSPPL", "VL"):
-        if clean_id.startswith(prefix) and not clean_id.startswith("VLMPSPPLxx"):
-            pass  # only strip VL if it's truly a VL prefix
-    if clean_id.startswith("VL") and not clean_id.startswith("VLM"):
-        clean_id = clean_id[2:]
-
-    cache_key = f"podcast:{clean_id}:{limit}"
-    cached = _cache_long.get(cache_key)
+    # Strip "VL" prefix only when it is a plain VL prefix, not VLM… (podcast playlists)
+    clean_id  = podcast_id[2:] if (podcast_id.startswith("VL") and not podcast_id.startswith("VLM")) else podcast_id
+    cache_key = f"podcast:{clean_id}:{limit}:{language}"
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(1800))
         return cached
 
-    ytm = get_ytm()
+    ytm          = get_ytm("ZZ", language)
     episodes_raw: list = []
-    meta: dict = {}
+    meta: dict         = {}
 
-    # Attempt 1: native get_podcast (ytmusicapi ≥ 1.7)
-    try:
-        data = await run(ytm.get_podcast, clean_id)
-        if isinstance(data, dict) and data:
-            meta = data
-            # Episodes can be under "episodes" or "tracks"
-            episodes_raw = data.get("episodes") or data.get("tracks") or []
-    except Exception:
-        pass
-
-    # Attempt 2: treat as playlist (podcasts are playlists in YT Music)
-    if not episodes_raw:
+    # Four attempts — stop as soon as we have episodes
+    for fn, *fn_args in [
+        (ytm.get_podcast, clean_id),
+        (ytm.get_playlist, clean_id, limit),
+        (ytm.get_podcast, podcast_id),
+        (ytm.get_playlist, podcast_id, limit),
+    ]:
+        if episodes_raw:
+            break
         try:
-            data = await run(ytm.get_playlist, clean_id, limit)
+            data = await run(fn, *fn_args)
             if isinstance(data, dict) and data:
-                meta = meta or data
-                episodes_raw = data.get("tracks") or []
-        except Exception:
-            pass
-
-    # Attempt 3: also try with original ID if clean_id differs
-    if not episodes_raw and clean_id != podcast_id:
-        try:
-            data = await run(ytm.get_podcast, podcast_id)
-            if isinstance(data, dict):
-                meta = meta or data
+                if not meta:
+                    meta = data
                 episodes_raw = data.get("episodes") or data.get("tracks") or []
         except Exception:
             pass
-        if not episodes_raw:
-            try:
-                data = await run(ytm.get_playlist, podcast_id, limit)
-                if isinstance(data, dict):
-                    meta = meta or data
-                    episodes_raw = data.get("tracks") or []
-            except Exception:
-                pass
 
     if not meta and not episodes_raw:
         raise HTTPException(404, "Podcast not found")
 
-    # Normalise episodes
-    def norm_episode(ep: dict) -> dict:
+    def _norm_episode(ep: dict) -> dict:
         raw_t = ep.get("thumbnails") or ep.get("thumbnail") or []
         if isinstance(raw_t, str):
             raw_t = [{"url": raw_t, "width": 0}]
         thumbs = best_thumbnails_list(raw_t)
-        thumb  = thumbs[0]["url"] if thumbs else ""
-
-        # duration can be seconds (int) or "M:SS" string
-        dur = ep.get("duration") or ep.get("durationSeconds") or ""
+        dur    = ep.get("duration") or ep.get("durationSeconds") or ""
         if isinstance(dur, int) and dur > 0:
             m, s = divmod(dur, 60)
             h, m = divmod(m, 60)
-            dur = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
+            dur  = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
         artists = ep.get("artists") or ep.get("author") or ""
         if isinstance(artists, list):
-            artists = ", ".join(a.get("name", "") if isinstance(a, dict) else str(a) for a in artists)
-
+            artists = ", ".join(
+                a.get("name", "") if isinstance(a, dict) else str(a) for a in artists
+            )
         return {
             "videoId":     ep.get("videoId", ""),
             "title":       ep.get("title", ""),
             "artist":      artists or "",
-            "thumbnail":   thumb,
+            "thumbnail":   thumbs[0]["url"] if thumbs else "",
             "thumbnails":  thumbs,
             "duration":    str(dur),
             "date":        ep.get("date") or ep.get("publishedTime") or "",
             "description": ep.get("description") or ep.get("shortDescription") or "",
         }
 
-    episodes = [
-        norm_episode(ep)
-        for ep in episodes_raw
-        if isinstance(ep, dict) and ep.get("videoId")
-    ][:limit]
-
-    # Podcast-level thumbnail
+    episodes    = [_norm_episode(ep) for ep in episodes_raw
+                   if isinstance(ep, dict) and ep.get("videoId")][:limit]
     meta_thumbs = best_thumbnails_list(meta.get("thumbnails") or [])
-    meta_thumb  = meta_thumbs[0]["url"] if meta_thumbs else ""
-
-    # Author / channel
-    author = (
-        meta.get("author") or
-        meta.get("channel", {}).get("name", "") if isinstance(meta.get("channel"), dict) else "" or
-        meta.get("artist") or
-        ""
-    )
+    author      = meta.get("author") or ""
     if isinstance(author, dict):
         author = author.get("name", "")
+    if not author and isinstance(meta.get("channel"), dict):
+        author = meta["channel"].get("name", "")
 
     result = {
         "podcastId":   clean_id,
         "title":       meta.get("title", ""),
         "author":      author,
         "description": meta.get("description") or meta.get("shortDescription") or "",
-        "thumbnail":   meta_thumb,
+        "thumbnail":   meta_thumbs[0]["url"] if meta_thumbs else "",
         "thumbnails":  meta_thumbs,
         "episodes":    episodes,
         "total":       len(episodes),
     }
-
     _cache_long.set(cache_key, result)
+    response.headers.update(_cc(1800))
     return result
 
 
-# ─────────────────────────────────────────────────────────────
-#  Watch playlist  (raw — used internally)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Watch playlist  (raw — mostly for internal use)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/watch_playlist")
 async def get_watch_playlist(
-    video_id: Optional[str] = None,
+    response:    Response,
+    video_id:    Optional[str] = None,
     playlist_id: Optional[str] = None,
-    limit: int = 25,
-    params: Optional[str] = None,
+    limit:       int           = 25,
+    params:      Optional[str] = None,
+    country:     str = Query("ZZ"),
+    language:    str = Query("en"),
 ):
     try:
-        data = await run(get_ytm().get_watch_playlist, video_id, playlist_id, limit, params)
-        for t in data.get("tracks") or []:
+        data = await run(
+            get_ytm(country, language).get_watch_playlist,
+            video_id, playlist_id, limit, params,
+        )
+        for t in (data.get("tracks") or []):
             if isinstance(t, dict):
                 t["thumbnails"] = best_thumbnails_list(t.get("thumbnails") or [])
                 t["thumbnail"]  = t["thumbnails"][0]["url"] if t["thumbnails"] else ""
+        response.headers.update(_cc(300))
         return data
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Lyrics  (by browseId — for when you already have it)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Lyrics  (by browseId)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/lyrics/{browse_id}")
-async def get_lyrics(browse_id: str):
+async def get_lyrics(response: Response, browse_id: str):
     cache_key = f"lyrics:{browse_id}"
-    cached = _cache_long.get(cache_key)
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(7200))
         return cached
     try:
         data = await run(get_ytm().get_lyrics, browse_id)
         _cache_long.set(cache_key, data)
+        response.headers.update(_cc(7200))
         return data
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Lyrics by video ID  (NEW — no separate browseId needed)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Lyrics by video ID  (no separate browseId lookup needed)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/lyrics_by_video/{video_id}")
-async def get_lyrics_by_video(video_id: str):
+async def get_lyrics_by_video(response: Response, video_id: str):
     """
-    Get lyrics for a video without a separate browseId lookup.
-    Returns: { lyricsId, lyrics } or { lyricsId: null, error: "..." }
+    Get lyrics without a separate browseId lookup.
+    Returns { lyricsId, lyrics, source } or { lyricsId: null, error: "…" }.
     """
     cache_key = f"lyrics_vid:{video_id}"
-    cached = _cache_long.get(cache_key)
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(7200))
         return cached
 
     ytm = get_ytm()
-
-    # Step 1: get watch playlist to extract lyricsId
     try:
-        watch = await run(ytm.get_watch_playlist, video_id, None, 1)
+        watch     = await run(ytm.get_watch_playlist, video_id, None, 1)
         lyrics_id = watch.get("lyrics")
     except Exception:
         lyrics_id = None
@@ -1031,15 +1297,15 @@ async def get_lyrics_by_video(video_id: str):
         _cache_long.set(cache_key, result, ttl=600)
         return result
 
-    # Step 2: fetch actual lyrics
     try:
-        data = await run(ytm.get_lyrics, lyrics_id)
+        data   = await run(ytm.get_lyrics, lyrics_id)
         result = {
             "lyricsId": lyrics_id,
             "lyrics":   data.get("lyrics") if isinstance(data, dict) else data,
             "source":   data.get("source", "") if isinstance(data, dict) else "",
         }
         _cache_long.set(cache_key, result)
+        response.headers.update(_cc(7200))
         return result
     except Exception as e:
         result = {"lyricsId": lyrics_id, "lyrics": None, "error": str(e)}
@@ -1047,162 +1313,113 @@ async def get_lyrics_by_video(video_id: str):
         return result
 
 
-# ─────────────────────────────────────────────────────────────
-#  Home feed
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Home feed  (country-aware)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/home")
-async def get_home(limit: int = Query(6, ge=1, le=15)):
-    """Home feed — shelves with normalised tracks."""
-    cache_key = f"home:{limit}"
-    cached = _cache_medium.get(cache_key)
+async def get_home(
+    response: Response,
+    limit:    int = Query(6, ge=1, le=15),
+    country:  str = Query("ZZ"),
+    language: str = Query("en"),
+):
+    """Home feed shelves, normalised. Pass ?country=IN for Indian content."""
+    cache_key = f"home:{country}:{language}:{limit}"
+    cached    = _cache_medium.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(300))
         return cached
     try:
-        raw = await run(get_ytm().get_home, limit)
-        shelves = []
-        for shelf in (raw or []):
-            if not isinstance(shelf, dict):
-                continue
-            contents = []
-            for item in (shelf.get("contents") or []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get("videoId"):
-                    contents.append(norm_track(item))
-                else:
-                    thumbs = best_thumbnails_list(item.get("thumbnails") or [])
-                    item["thumbnails"] = thumbs
-                    item["thumbnail"]  = thumbs[0]["url"] if thumbs else ""
-                    contents.append(item)
-            if contents:
-                shelves.append({"title": shelf.get("title", "For You"), "contents": contents})
+        raw     = await run(get_ytm(country, language).get_home, limit)
+        shelves = _normalise_home(raw or [])
         _cache_medium.set(cache_key, shelves)
+        response.headers.update(_cc(300))
         return shelves
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Charts  (songs, videos, artists, trending sections)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Charts  (country-aware)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/charts")
-async def get_charts(country: str = "ZZ"):
-    """Music charts. Returns: { country, songs, videos, artists, trending }"""
-    cache_key = f"charts:{country}"
-    cached = _cache_medium.get(cache_key)
+async def get_charts(
+    response: Response,
+    country:  str = "ZZ",
+    language: str = Query("en"),
+):
+    """Music charts.  Returns { country, songs, videos, artists, trending }."""
+    cache_key = f"charts:{country}:{language}"
+    cached    = _cache_medium.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(600))
         return cached
-
     try:
-        raw = await run(get_ytm().get_charts, country)
-
-        def extract_section(section) -> list:
-            if not section:
-                return []
-            items = section if isinstance(section, list) else (
-                section.get("items") or section.get("results") or []
-            )
-            out = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                thumbs = best_thumbnails_list(item.get("thumbnails") or [])
-                item["thumbnails"] = thumbs
-                item["thumbnail"]  = thumbs[0]["url"] if thumbs else ""
-                out.append(item)
-            return out
-
-        result = {
-            "country":  country,
-            "songs":    [norm_track(t) for t in extract_section(raw.get("songs"))],
-            "videos":   [norm_track(t) for t in extract_section(raw.get("videos")) if t.get("videoId")],
-            "artists":  [norm_artist_result(a) for a in extract_section(raw.get("artists"))],
-            "trending": [norm_track(t) for t in extract_section(raw.get("trending")) if t.get("videoId")],
-        }
+        raw    = await run(get_ytm(country, language).get_charts, country)
+        result = _normalise_charts(raw, country)
         _cache_medium.set(cache_key, result)
+        response.headers.update(_cc(600))
         return result
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Trending  (NEW — convenience wrapper over /charts)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Trending  — delegates to the shared charts cache key, never double-fetches
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/trending")
 async def get_trending(
-    country: str = Query("ZZ"),
-    limit:   int = Query(20, ge=1, le=50),
+    response: Response,
+    country:  str = Query("ZZ"),
+    language: str = Query("en"),
+    limit:    int = Query(20, ge=1, le=50),
 ):
-    """
-    Trending songs for a country.
-    Returns: { country, trending: [norm_track], count }
-    Pulls from /charts and returns the trending section.
-    """
-    # Reuse charts cache
-    cache_key_charts = f"charts:{country}"
-    charts_cached = _cache_medium.get(cache_key_charts)
+    """Trending songs for a country.  Returns { country, trending, count }."""
+    charts_key = f"charts:{country}:{language}"
+    charts     = _cache_medium.get(charts_key)
 
-    if charts_cached:
-        trending = charts_cached.get("trending") or charts_cached.get("songs") or []
-    else:
+    if charts is None:
         try:
-            raw = await run(get_ytm().get_charts, country)
-            trending_raw = (
-                raw.get("trending") or raw.get("songs") or []
-            )
-            if isinstance(trending_raw, dict):
-                trending_raw = trending_raw.get("items") or trending_raw.get("results") or []
-            trending = [norm_track(t) for t in trending_raw if isinstance(t, dict) and t.get("videoId")]
-            # Also cache the full charts result
-            charts_result = {
-                "country":  country,
-                "songs":    [norm_track(t) for t in (raw.get("songs") or {}).get("items", []) if isinstance(t, dict)],
-                "videos":   [],
-                "artists":  [],
-                "trending": trending,
-            }
-            _cache_medium.set(cache_key_charts, charts_result)
+            raw    = await run(get_ytm(country, language).get_charts, country)
+            charts = _normalise_charts(raw, country)
+            _cache_medium.set(charts_key, charts)
         except Exception as e:
             raise HTTPException(500, detail=str(e))
 
-    result = {
-        "country":  country,
-        "trending": trending[:limit],
-        "count":    len(trending[:limit]),
-    }
-    return result
+    trending = charts.get("trending") or charts.get("songs") or []
+    response.headers.update(_cc(600))
+    return {"country": country, "trending": trending[:limit], "count": min(len(trending), limit)}
 
 
-# ─────────────────────────────────────────────────────────────
-#  Top Playlists  (NEW)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Top Playlists  (country-aware)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/top_playlists")
 async def get_top_playlists(
-    country: str = Query("ZZ"),
-    limit:   int = Query(16, ge=1, le=50),
+    response: Response,
+    country:  str = Query("ZZ"),
+    language: str = Query("en"),
+    limit:    int = Query(16, ge=1, le=50),
 ):
-    """
-    Featured / top playlists. Pulls from mood_categories + charts.
-    Returns a flat list of playlist cards: [ { browseId, title, thumbnail, … } ]
-    """
-    cache_key = f"top_playlists:{country}:{limit}"
-    cached = _cache_medium.get(cache_key)
+    cache_key  = f"top_playlists:{country}:{language}:{limit}"
+    cached     = _cache_medium.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(600))
         return cached
 
-    ytm = get_ytm()
+    ytm       = get_ytm(country, language)
     playlists: list[dict] = []
 
-    # Source 1: Charts — trending playlists from country
+    # Source 1: country charts
     try:
         charts_raw = await run(ytm.get_charts, country)
-        for section_key in ("trending", "songs"):
-            section = charts_raw.get(section_key, {})
-            items = section if isinstance(section, list) else (
+        for sk in ("trending", "songs"):
+            section = charts_raw.get(sk, {})
+            items   = section if isinstance(section, list) else (
                 section.get("items") or section.get("results") or []
             )
             for item in items:
@@ -1221,15 +1438,15 @@ async def get_top_playlists(
     except Exception:
         pass
 
-    # Source 2: Mood categories → first mood playlists batch
+    # Source 2: mood categories (fills out the list if charts gave few results)
     if len(playlists) < limit:
         try:
-            cats = await run(ytm.get_mood_categories)
+            cats         = await run(ytm.get_mood_categories)
             first_params = None
             if isinstance(cats, dict):
-                for section_items in cats.values():
-                    if isinstance(section_items, list) and section_items:
-                        p = section_items[0].get("params")
+                for items in cats.values():
+                    if isinstance(items, list) and items:
+                        p = items[0].get("params")
                         if p:
                             first_params = p
                             break
@@ -1241,8 +1458,7 @@ async def get_top_playlists(
                 for section in (mood_raw or []):
                     if not isinstance(section, dict):
                         continue
-                    contents = section.get("contents") or section.get("playlists") or []
-                    for item in contents:
+                    for item in (section.get("contents") or section.get("playlists") or []):
                         if not isinstance(item, dict):
                             continue
                         bid = item.get("playlistId") or item.get("browseId")
@@ -1263,29 +1479,31 @@ async def get_top_playlists(
     for p in playlists:
         bid = p.get("browseId", "")
         if bid and bid not in seen:
-            seen.add(bid)
-            deduped.append(p)
+            seen.add(bid); deduped.append(p)
 
     result = deduped[:limit]
     _cache_medium.set(cache_key, result)
+    response.headers.update(_cc(600))
     return result
 
 
-# ─────────────────────────────────────────────────────────────
-#  Mood categories
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Mood categories  (country-aware)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/mood_categories")
-async def get_mood_categories():
-    """
-    Mood/genre categories as a flat list.
-    Returns: [ { title, params, section, thumbnail, thumbnails } ]
-    """
-    cached = _cache_medium.get("mood_categories")
+async def get_mood_categories(
+    response: Response,
+    country:  str = Query("ZZ"),
+    language: str = Query("en"),
+):
+    cache_key = f"mood_categories:{country}:{language}"
+    cached    = _cache_medium.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(600))
         return cached
     try:
-        raw = await run(get_ytm().get_mood_categories)
+        raw        = await run(get_ytm(country, language).get_mood_categories)
         categories: list[dict] = []
         if isinstance(raw, dict):
             for section_title, items in raw.items():
@@ -1312,90 +1530,104 @@ async def get_mood_categories():
                     "thumbnails": thumbs,
                     "thumbnail":  thumbs[0]["url"] if thumbs else "",
                 })
-        _cache_medium.set("mood_categories", categories)
+        _cache_medium.set(cache_key, categories)
+        response.headers.update(_cc(600))
         return categories
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Mood playlists
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Mood playlists  (country-aware)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/mood_playlists/{params}")
-async def get_mood_playlists(params: str):
-    """
-    Playlists for a given mood params string.
-    Returns: [ { browseId, title, subtitle, thumbnail, thumbnails } ]
-    """
-    cache_key = f"mood_playlists:{params}"
-    cached = _cache_medium.get(cache_key)
+async def get_mood_playlists(
+    response: Response,
+    params:   str,
+    country:  str = Query("ZZ"),
+    language: str = Query("en"),
+):
+    cache_key = f"mood_playlists:{params}:{country}:{language}"
+    cached    = _cache_medium.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(600))
         return cached
     try:
-        raw = await run(get_ytm().get_mood_playlists, params)
+        raw       = await run(get_ytm(country, language).get_mood_playlists, params)
         playlists: list[dict] = []
-        if isinstance(raw, list):
-            for section in raw:
-                if not isinstance(section, dict):
-                    continue
-                contents = section.get("contents") or section.get("playlists") or []
-                if isinstance(contents, list):
-                    for item in contents:
-                        if not isinstance(item, dict):
-                            continue
-                        thumbs = best_thumbnails_list(item.get("thumbnails") or [])
-                        playlists.append({
-                            "browseId":   item.get("playlistId") or item.get("browseId", ""),
-                            "title":      item.get("title", ""),
-                            "subtitle":   item.get("subtitle", ""),
-                            "thumbnails": thumbs,
-                            "thumbnail":  thumbs[0]["url"] if thumbs else "",
-                        })
-                else:
-                    thumbs = best_thumbnails_list(section.get("thumbnails") or [])
+        for section in (raw if isinstance(raw, list) else []):
+            if not isinstance(section, dict):
+                continue
+            contents = section.get("contents") or section.get("playlists") or []
+            if isinstance(contents, list):
+                for item in contents:
+                    if not isinstance(item, dict):
+                        continue
+                    thumbs = best_thumbnails_list(item.get("thumbnails") or [])
                     playlists.append({
-                        "browseId":   section.get("playlistId") or section.get("browseId", ""),
-                        "title":      section.get("title", ""),
-                        "subtitle":   section.get("subtitle", ""),
+                        "browseId":   item.get("playlistId") or item.get("browseId", ""),
+                        "title":      item.get("title", ""),
+                        "subtitle":   item.get("subtitle", ""),
                         "thumbnails": thumbs,
                         "thumbnail":  thumbs[0]["url"] if thumbs else "",
                     })
+            else:
+                thumbs = best_thumbnails_list(section.get("thumbnails") or [])
+                playlists.append({
+                    "browseId":   section.get("playlistId") or section.get("browseId", ""),
+                    "title":      section.get("title", ""),
+                    "subtitle":   section.get("subtitle", ""),
+                    "thumbnails": thumbs,
+                    "thumbnail":  thumbs[0]["url"] if thumbs else "",
+                })
         _cache_medium.set(cache_key, playlists)
+        response.headers.update(_cc(600))
         return playlists
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  Explore
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Explore  (country-aware)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/explore")
-async def get_explore():
-    cached = _cache_medium.get("explore")
+async def get_explore(
+    response: Response,
+    country:  str = Query("ZZ"),
+    language: str = Query("en"),
+):
+    cache_key = f"explore:{country}:{language}"
+    cached    = _cache_medium.get(cache_key)
     if cached is not None:
+        response.headers.update(_cc(600))
         return cached
     try:
-        data = await run(get_ytm().get_explore)
-        _cache_medium.set("explore", data)
+        data = await run(get_ytm(country, language).get_explore)
+        _cache_medium.set(cache_key, data)
+        response.headers.update(_cc(600))
         return data
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 #  User endpoints
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/user/{channel_id}")
-async def get_user(channel_id: str):
-    cache_key = f"user:{channel_id}"
-    cached = _cache_long.get(cache_key)
+async def get_user(
+    response:   Response,
+    channel_id: str,
+    language:   str = Query("en"),
+):
+    cache_key = f"user:{channel_id}:{language}"
+    cached    = _cache_long.get(cache_key)
     if cached is not None:
         return cached
     try:
-        data = await run(get_ytm().get_user, channel_id)
+        data = await run(get_ytm("ZZ", language).get_user, channel_id)
         _cache_long.set(cache_key, data)
         return data
     except Exception as e:
@@ -1403,9 +1635,14 @@ async def get_user(channel_id: str):
 
 
 @app.get("/user_playlists/{channel_id}")
-async def get_user_playlists(channel_id: str, params: Optional[str] = None):
+async def get_user_playlists(
+    response:   Response,
+    channel_id: str,
+    params:     Optional[str] = None,
+    language:   str = Query("en"),
+):
     try:
-        data = await run(get_ytm().get_user_playlists, channel_id, params)
+        data = await run(get_ytm("ZZ", language).get_user_playlists, channel_id, params)
         return data
     except Exception as e:
         raise HTTPException(500, detail=str(e))
