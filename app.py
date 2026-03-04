@@ -743,7 +743,7 @@ async def get_artist(
 async def get_artist_songs(
     response:  Response,
     artist_id: str,
-    limit:     int = Query(100, ge=1, le=200),
+    limit:     int = Query(500, ge=1, le=5000),
     language:  str = Query("en"),
 ):
     cache_key = f"artist_songs:{artist_id}:{limit}:{language}"
@@ -756,52 +756,182 @@ async def get_artist_songs(
         artist_data = await run(ytm.get_artist, artist_id)
         if not artist_data:
             raise HTTPException(404, "Artist not found")
-        artist_name   = artist_data.get("name", "")
-        songs_section = artist_data.get("songs", {})
-        params_token  = None
-        if isinstance(songs_section, dict):
-            params_token = songs_section.get("params") or songs_section.get("browseId")
+        artist_name = artist_data.get("name", "")
+        channel_id  = artist_data.get("channelId", artist_id)
 
-        songs_raw: list = []
+        # Collect all album/single browse entries from the artist page
+        album_entries: list[dict] = []
+        for section_key in ("albums", "singles"):
+            section = artist_data.get(section_key, {})
+            if not isinstance(section, dict):
+                continue
+            params = section.get("params")
+            if params and channel_id:
+                try:
+                    more = await run(ytm.get_artist_albums, channel_id, params)
+                    if isinstance(more, list):
+                        album_entries.extend(more)
+                    elif isinstance(more, dict):
+                        album_entries.extend(more.get("results") or more.get("items") or [])
+                except Exception:
+                    album_entries.extend(section.get("results") or section.get("items") or [])
+            else:
+                album_entries.extend(section.get("results") or section.get("items") or [])
 
-        # Strategy 1: follow the "all songs" browse token
-        if params_token:
+        # Fetch all tracks from each album/single concurrently (batch of 5)
+        async def fetch_album_tracks(entry: dict) -> tuple[dict, list]:
+            bid = entry.get("browseId")
+            if not bid:
+                return entry, []
             try:
-                more = await run(ytm.get_artist_albums, artist_id, params_token)
-                if isinstance(more, list):
-                    songs_raw = more
-                elif isinstance(more, dict):
-                    songs_raw = (
-                        more.get("results") or more.get("items") or
-                        more.get("songs") or more.get("tracks") or []
-                    )
+                data = await run(ytm.get_album, bid)
+                return entry, data.get("tracks") or []
             except Exception:
-                songs_raw = []
+                return entry, []
 
-        # Strategy 2: initial songs already on the artist page
-        if not songs_raw and isinstance(songs_section, dict):
-            songs_raw = list(songs_section.get("results") or songs_section.get("items") or [])
+        all_tracks:  list[dict] = []
+        albums_info: list[dict] = []
+        # Batch of 5: balances concurrency against rate-limit pressure
+        batch_size = 5
+        for i in range(0, len(album_entries), batch_size):
+            batch   = album_entries[i:i + batch_size]
+            results = await asyncio.gather(*[fetch_album_tracks(e) for e in batch])
+            for entry, tracks in results:
+                bid    = entry.get("browseId", "")
+                thumbs = best_thumbnails_list(entry.get("thumbnails") or [])
+                albums_info.append({
+                    "browseId":   bid,
+                    "title":      entry.get("title", ""),
+                    "year":       entry.get("year", ""),
+                    "type":       entry.get("type", "Album"),
+                    "trackCount": len(tracks),
+                    "thumbnails": thumbs,
+                    "thumbnail":  thumbs[0]["url"] if thumbs else "",
+                })
+                for t in tracks:
+                    if isinstance(t, dict) and t.get("videoId"):
+                        if not t.get("album") or not t.get("year"):
+                            t = dict(t)
+                            if not t.get("album"):
+                                t["album"] = {"name": entry.get("title", "")}
+                            if not t.get("year"):
+                                t["year"] = entry.get("year", "")
+                        all_tracks.append(t)
 
-        # Strategy 3: search fallback
-        if not songs_raw and artist_name:
-            try:
-                sr = await run(ytm.search, artist_name, "songs", None, min(limit, 50), False)
-                songs_raw = sr if isinstance(sr, list) else []
-            except Exception:
-                pass
-
-        tracks = [norm_track(t) for t in songs_raw if isinstance(t, dict) and t.get("videoId")]
+        # Normalize and deduplicate
         seen, deduped = set(), []
-        for t in tracks:
+        for t in all_tracks:
             vid = t.get("videoId", "")
             if vid and vid not in seen:
-                seen.add(vid); deduped.append(t)
+                seen.add(vid)
+                deduped.append(norm_track(t))
 
         result = {
             "artistId": artist_id,
             "name":     artist_name,
             "songs":    deduped[:limit],
             "total":    len(deduped),
+            "albums":   albums_info,
+        }
+        _cache_long.set(cache_key, result)
+        response.headers.update(_cc(600))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Artist — all albums
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/artist/{artist_id}/albums")
+async def get_artist_albums_endpoint(
+    response:  Response,
+    artist_id: str,
+    language:  str = Query("en"),
+):
+    cache_key = f"artist_albums:{artist_id}:{language}"
+    cached    = _cache_long.get(cache_key)
+    if cached is not None:
+        response.headers.update(_cc(600))
+        return cached
+    try:
+        ytm         = get_ytm("ZZ", language)
+        artist_data = await run(ytm.get_artist, artist_id)
+        if not artist_data:
+            raise HTTPException(404, "Artist not found")
+        artist_name = artist_data.get("name", "")
+        channel_id  = artist_data.get("channelId", artist_id)
+
+        # Collect all album/single entries
+        album_entries: list[dict] = []
+        for section_key in ("albums", "singles"):
+            section = artist_data.get(section_key, {})
+            if not isinstance(section, dict):
+                continue
+            params = section.get("params")
+            if params and channel_id:
+                try:
+                    more = await run(ytm.get_artist_albums, channel_id, params)
+                    if isinstance(more, list):
+                        album_entries.extend(more)
+                    elif isinstance(more, dict):
+                        album_entries.extend(more.get("results") or more.get("items") or [])
+                except Exception:
+                    album_entries.extend(section.get("results") or section.get("items") or [])
+            else:
+                album_entries.extend(section.get("results") or section.get("items") or [])
+
+        # Fetch full track listings concurrently (batch of 5)
+        async def fetch_album_detail(entry: dict) -> dict:
+            bid    = entry.get("browseId")
+            thumbs = best_thumbnails_list(entry.get("thumbnails") or [])
+            base: dict = {
+                "browseId":   bid or "",
+                "title":      entry.get("title", ""),
+                "year":       entry.get("year", ""),
+                "type":       entry.get("type", "Album"),
+                "thumbnails": thumbs,
+                "thumbnail":  thumbs[0]["url"] if thumbs else "",
+                "tracks":     [],
+            }
+            if not bid:
+                return base
+            try:
+                data   = await run(ytm.get_album, bid)
+                tracks = data.get("tracks") or []
+                normed = []
+                for t in tracks:
+                    if isinstance(t, dict) and t.get("videoId"):
+                        if not t.get("album") or not t.get("year"):
+                            t = dict(t)
+                            if not t.get("album"):
+                                t["album"] = {"name": entry.get("title", "")}
+                            if not t.get("year"):
+                                t["year"] = entry.get("year", "")
+                        normed.append(norm_track(t))
+                base["tracks"] = normed
+            except Exception:
+                pass
+            return base
+
+        albums_out: list[dict] = []
+        # Batch of 5: balances concurrency against rate-limit pressure
+        batch_size = 5
+        for i in range(0, len(album_entries), batch_size):
+            batch   = album_entries[i:i + batch_size]
+            results = await asyncio.gather(*[fetch_album_detail(e) for e in batch])
+            albums_out.extend(results)
+
+        total_tracks = sum(len(a["tracks"]) for a in albums_out)
+        result = {
+            "artistId":    artist_id,
+            "name":        artist_name,
+            "albums":      albums_out,
+            "totalAlbums": len(albums_out),
+            "totalTracks": total_tracks,
         }
         _cache_long.set(cache_key, result)
         response.headers.update(_cc(600))
